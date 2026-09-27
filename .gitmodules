@@ -1,0 +1,3 @@
+[submodule "horarios-cine"]
+	path = horarios-cine
+	url = https://github.com/wdarko85/horarios-cine.git
