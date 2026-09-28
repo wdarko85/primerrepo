@@ -18,6 +18,7 @@ Variables de entorno:
 """
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -25,6 +26,32 @@ from pathlib import Path
 
 MAX_PROMPT_CHARS = 500
 MAX_SUMMARY_CHARS = 2000
+
+CODE_START_RE = re.compile(r'^(//|/\*|#!|\$ |> |@"|@\')')
+SHELL_CMD_RE = re.compile(r"^(docker|npm|git|curl|sudo|python3?|bash|sh|brew|pip3?|node|yarn)\b")
+
+
+def looks_like_code_or_path(text):
+    """Detecta la primera línea de un script, ruta o comando pegado, para no
+    usarla como título de la sesión (p. ej. "// ==UserScript==" o
+    "/Applications/OF-DL.app" en vez de lo que el usuario pidió de verdad)."""
+    t = text.strip()
+    if not t:
+        return True
+    head = t[:60]
+    if CODE_START_RE.match(t) or "==UserScript==" in t or "==UserStyle==" in t:
+        return True
+    first_word = t.split(None, 1)[0]
+    if first_word.startswith("/") and first_word.count("/") >= 2:
+        return True
+    if SHELL_CMD_RE.match(t):
+        return True
+    if t.startswith("at ") and "(" in t:  # línea de stack trace
+        return True
+    letters = sum(c.isalpha() for c in head)
+    if len(head) >= 15 and letters / len(head) < 0.35:  # línea de símbolos/código
+        return True
+    return False
 
 
 def run(cmd, cwd):
@@ -144,6 +171,19 @@ def parse_time(stamp):
         return datetime.now().astimezone()
 
 
+def pick_title(info):
+    """Título de la sesión: el que puso Claude si es legible; si no, la primera
+    petición del usuario que no sea código/ruta/comando pegado; si ninguna lo
+    es, "Sesión"."""
+    if info["title"] and not looks_like_code_or_path(info["title"]):
+        return info["title"]
+    for p in info["prompts"]:
+        line = p.splitlines()[0].strip()
+        if line and not looks_like_code_or_path(line):
+            return line[:80]
+    return "Sesión"
+
+
 def build_note(session_id, info, cwd, event):
     project = project_name(cwd, info["files"])
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
@@ -153,7 +193,7 @@ def build_note(session_id, info, cwd, event):
         if event == "SessionEnd" and info["end"]:
             log.insert(3, f"--until={info['end']}")
         commits = run(log, cwd)
-    title = info["title"] or (info["prompts"][0].splitlines()[0][:80] if info["prompts"] else "Sesión")
+    title = pick_title(info)
     started = parse_time(info["start"])
     now = datetime.now().astimezone()
 
