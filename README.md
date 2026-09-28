@@ -29,6 +29,21 @@ actualiza una nota por sesión en tu vault con:
 Para usarlo en **todos** tus proyectos, copia el script a `~/.claude/hooks/` y
 pon el bloque `hooks` en `~/.claude/settings.json` apuntando a esa ruta.
 
+Las notas se guardan agrupadas por proyecto:
+`Claude Sessions/<proyecto>/<fecha> <proyecto> <id>.md`.
+
+### Importar sesiones anteriores
+
+Para volcar al vault todas las sesiones que ya tienes en `~/.claude/projects`
+(de todos los proyectos, con su fecha real):
+
+```bash
+OBSIDIAN_VAULT=/ruta/a/tu/vault OBSIDIAN_DAILY_FOLDER=Daily \
+  python3 ~/.claude/hooks/obsidian_session_log.py --backfill
+```
+
+Se puede repetir sin miedo: las sesiones ya importadas se actualizan, no se duplican.
+
 **En Claude Code en la web (sesiones en la nube):** el contenedor no ve tu disco,
 así que el vault tiene que ser un repo de GitHub sincronizado con el plugin
 Obsidian Git. En el script de setup del entorno clona el vault y define

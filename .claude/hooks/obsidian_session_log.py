@@ -3,8 +3,11 @@
 
 Se ejecuta en los eventos Stop (tras cada respuesta) y SessionEnd. Lee el JSON
 del hook por stdin, recorre el transcript de la sesión y genera una nota en
-"$OBSIDIAN_VAULT/$OBSIDIAN_FOLDER/<fecha> <proyecto> <id>.md". La nota se
-sobrescribe en cada ejecución, así que siempre refleja el estado más reciente.
+"$OBSIDIAN_VAULT/$OBSIDIAN_FOLDER/<proyecto>/<fecha> <proyecto> <id>.md". La nota
+se sobrescribe en cada ejecución, así que siempre refleja el estado más reciente.
+
+Importar sesiones antiguas (todas las de ~/.claude/projects, de todos los
+proyectos):  python3 obsidian_session_log.py --backfill
 
 Variables de entorno:
   OBSIDIAN_VAULT         Ruta al vault (obligatoria; si falta, el hook no hace nada)
@@ -49,7 +52,7 @@ def text_of(content):
 
 
 def parse_transcript(path):
-    info = {"title": None, "prompts": [], "files": [], "last_reply": "", "start": None}
+    info = {"title": None, "prompts": [], "files": [], "last_reply": "", "start": None, "end": None, "cwd": None}
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -60,8 +63,11 @@ def parse_transcript(path):
         except json.JSONDecodeError:
             continue
         kind = entry.get("type")
-        if info["start"] is None and entry.get("timestamp"):
-            info["start"] = entry["timestamp"]
+        if entry.get("timestamp"):
+            info["start"] = info["start"] or entry["timestamp"]
+            info["end"] = entry["timestamp"]
+        if info["cwd"] is None and entry.get("cwd"):
+            info["cwd"] = entry["cwd"]
         if kind == "ai-title" and entry.get("aiTitle"):
             info["title"] = entry["aiTitle"]
         elif kind == "user" and not entry.get("isMeta") and not entry.get("isSidechain"):
@@ -101,13 +107,25 @@ def safe_name(text):
     return "".join(c for c in text if c not in bad).strip()
 
 
-def build_note(data, info, cwd, event):
+def parse_time(stamp):
+    # fromisoformat no acepta "Z" en Python < 3.11 (el de macOS suele ser 3.9)
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone()
+    except (AttributeError, ValueError):
+        return datetime.now().astimezone()
+
+
+def build_note(session_id, info, cwd, event):
     project = Path(cwd).name
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
     commits = ""
     if info["start"]:
-        commits = run(["git", "log", f"--since={info['start']}", "--format=- `%h` %s"], cwd)
+        log = ["git", "log", f"--since={info['start']}", "--format=- `%h` %s"]
+        if event == "SessionEnd" and info["end"]:
+            log.insert(3, f"--until={info['end']}")
+        commits = run(log, cwd)
     title = info["title"] or (info["prompts"][0].splitlines()[0][:80] if info["prompts"] else "Sesión")
+    started = parse_time(info["start"])
     now = datetime.now().astimezone()
 
     files = []
@@ -119,11 +137,11 @@ def build_note(data, info, cwd, event):
 
     out = [
         "---",
-        f"date: {now.strftime('%Y-%m-%d')}",
+        f"date: {started.strftime('%Y-%m-%d')}",
         f"updated: {now.isoformat(timespec='seconds')}",
         f"project: {json.dumps(project)}",
         f"branch: {json.dumps(branch)}",
-        f"session_id: {data.get('session_id', '')}",
+        f"session_id: {session_id}",
         f"status: {'finished' if event == 'SessionEnd' else 'active'}",
         "tags: [claude-session]",
         "---",
@@ -139,14 +157,14 @@ def build_note(data, info, cwd, event):
         out += ["", "## Commits", commits]
     if info["last_reply"]:
         out += ["", "## Última respuesta de Claude", truncate(info["last_reply"], MAX_SUMMARY_CHARS)]
-    return title, "\n".join(out) + "\n"
+    return title, started, "\n".join(out) + "\n"
 
 
-def link_in_daily(vault, note_path):
+def link_in_daily(vault, note_path, day):
     folder = os.environ.get("OBSIDIAN_DAILY_FOLDER")
     if not folder:
         return
-    daily = vault / folder / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+    daily = vault / folder / f"{day.strftime('%Y-%m-%d')}.md"
     daily.parent.mkdir(parents=True, exist_ok=True)
     link = f"- [[{note_path.relative_to(vault).with_suffix('').as_posix()}]]"
     existing = daily.read_text(encoding="utf-8") if daily.exists() else ""
@@ -168,34 +186,59 @@ def git_push(vault, message):
     run(["git", "push"], vault)
 
 
+def write_session(vault, session_id, transcript, cwd, event):
+    info = parse_transcript(transcript)
+    cwd = cwd or info["cwd"]
+    if not info["prompts"] or not cwd:
+        return None
+    title, started, note = build_note(session_id, info, cwd, event)
+
+    root = vault / os.environ.get("OBSIDIAN_FOLDER", "Claude Sessions")
+    project = safe_name(Path(cwd).name) or "sin-proyecto"
+    session = str(session_id)[:8]
+    # Reutiliza la nota existente de esta sesión aunque cambie el título o el día
+    matches = sorted(root.rglob(f"* {session}.md")) if session else []
+    note_path = matches[0] if matches else root / project / f"{started.strftime('%Y-%m-%d')} {project} {session}.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    note_path.write_text(note, encoding="utf-8")
+
+    link_in_daily(vault, note_path, started)
+    return title
+
+
+def backfill(vault):
+    projects = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser() / "projects"
+    count = 0
+    for transcript in sorted(projects.glob("*/*.jsonl")):
+        if write_session(vault, transcript.stem, transcript, None, "SessionEnd"):
+            count += 1
+    print(f"{count} sesiones importadas en {vault}")
+    git_push(vault, f"Claude sessions: backfill de {count} sesiones")
+
+
 def main():
     vault_env = os.environ.get("OBSIDIAN_VAULT")
     if not vault_env:
+        if "--backfill" in sys.argv:
+            print("Define OBSIDIAN_VAULT con la ruta de tu vault", file=sys.stderr)
+        return
+    vault = Path(vault_env).expanduser()
+    if "--backfill" in sys.argv:
+        backfill(vault)
         return
     data = json.load(sys.stdin)
     transcript = data.get("transcript_path")
     if not transcript:
         return
-    vault = Path(vault_env).expanduser()
-    cwd = data.get("cwd") or os.getcwd()
-    event = data.get("hook_event_name", "Stop")
-
-    info = parse_transcript(transcript)
-    if not info["prompts"]:
-        return
-    title, note = build_note(data, info, cwd, event)
-
-    folder = vault / os.environ.get("OBSIDIAN_FOLDER", "Claude Sessions")
-    folder.mkdir(parents=True, exist_ok=True)
-    date = datetime.now().strftime("%Y-%m-%d")
-    session = str(data.get("session_id", ""))[:8]
-    # Reutiliza la nota existente de esta sesión aunque cambie el título o el día
-    matches = sorted(folder.glob(f"* {session}.md")) if session else []
-    note_path = matches[0] if matches else folder / f"{date} {safe_name(Path(cwd).name)} {session}.md"
-    note_path.write_text(note, encoding="utf-8")
-
-    link_in_daily(vault, note_path)
-    git_push(vault, f"Claude session: {title[:60]}")
+    title = write_session(
+        vault,
+        data.get("session_id", ""),
+        transcript,
+        data.get("cwd") or os.getcwd(),
+        data.get("hook_event_name", "Stop"),
+    )
+    if title:
+        git_push(vault, f"Claude session: {title[:60]}")
 
 
 if __name__ == "__main__":
