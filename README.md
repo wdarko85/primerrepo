@@ -30,7 +30,10 @@ Para usarlo en **todos** tus proyectos, copia el script a `~/.claude/hooks/` y
 pon el bloque `hooks` en `~/.claude/settings.json` apuntando a esa ruta.
 
 Las notas se guardan agrupadas por proyecto:
-`Claude Sessions/<proyecto>/<fecha> <proyecto> <id>.md`.
+`Claude Sessions/<proyecto>/<fecha> <título de la sesión>.md`. El proyecto sale del
+repo git; si abriste Claude en una carpeta genérica (Documents, tu carpeta de
+usuario...) se deduce de los archivos que se tocaron, o va a `General`.
+Al volver a ejecutar `--backfill`, las notas con el formato antiguo se renombran.
 
 ### Importar sesiones anteriores
 

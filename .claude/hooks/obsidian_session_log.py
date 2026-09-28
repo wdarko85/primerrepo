@@ -3,7 +3,7 @@
 
 Se ejecuta en los eventos Stop (tras cada respuesta) y SessionEnd. Lee el JSON
 del hook por stdin, recorre el transcript de la sesión y genera una nota en
-"$OBSIDIAN_VAULT/$OBSIDIAN_FOLDER/<proyecto>/<fecha> <proyecto> <id>.md". La nota
+"$OBSIDIAN_VAULT/$OBSIDIAN_FOLDER/<proyecto>/<fecha> <título de la sesión>.md". La nota
 se sobrescribe en cada ejecución, así que siempre refleja el estado más reciente.
 
 Importar sesiones antiguas (todas las de ~/.claude/projects, de todos los
@@ -102,9 +102,38 @@ def parse_transcript(path):
     return info
 
 
-def safe_name(text):
+GENERIC_DIRS = {"", "Documents", "Documentos", "Desktop", "Escritorio", "Downloads", "Descargas", "tmp"}
+
+
+def safe_name(text, limit=90):
     bad = '\\/:*?"<>|#^[]'
-    return "".join(c for c in text if c not in bad).strip()
+    name = " ".join("".join(c for c in text if c not in bad).split())
+    return name[:limit].strip(" .")
+
+
+def project_name(cwd, files):
+    """Nombre legible del proyecto: el repo git, o la carpeta donde se trabajó de verdad."""
+    candidates = [cwd] + [str(Path(f).parent) for f in files]
+    for path in candidates:
+        if Path(path).is_dir():
+            top = run(["git", "rev-parse", "--show-toplevel"], path)
+            if top:
+                return Path(top).name
+    name = Path(cwd).name
+    if name not in GENERIC_DIRS and Path(cwd) != Path.home():
+        return name
+    # Sesión abierta desde una carpeta genérica: usa la carpeta de los archivos tocados
+    for f in files:
+        parts = Path(f).parts
+        if len(parts) > 3 and parts[1] == "Volumes":
+            return parts[3]  # /Volumes/<disco>/<proyecto>/...
+        try:
+            rel = Path(f).relative_to(cwd).parts
+        except ValueError:
+            continue
+        if len(rel) > 1:
+            return rel[0]
+    return "General"
 
 
 def parse_time(stamp):
@@ -116,7 +145,7 @@ def parse_time(stamp):
 
 
 def build_note(session_id, info, cwd, event):
-    project = Path(cwd).name
+    project = project_name(cwd, info["files"])
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
     commits = ""
     if info["start"]:
@@ -137,9 +166,10 @@ def build_note(session_id, info, cwd, event):
 
     out = [
         "---",
+        f"title: {json.dumps(title, ensure_ascii=False)}",
         f"date: {started.strftime('%Y-%m-%d')}",
         f"updated: {now.isoformat(timespec='seconds')}",
-        f"project: {json.dumps(project)}",
+        f"project: {json.dumps(project, ensure_ascii=False)}",
         f"branch: {json.dumps(branch)}",
         f"session_id: {session_id}",
         f"status: {'finished' if event == 'SessionEnd' else 'active'}",
@@ -157,19 +187,27 @@ def build_note(session_id, info, cwd, event):
         out += ["", "## Commits", commits]
     if info["last_reply"]:
         out += ["", "## Última respuesta de Claude", truncate(info["last_reply"], MAX_SUMMARY_CHARS)]
-    return title, started, "\n".join(out) + "\n"
+    return title, project, started, "\n".join(out) + "\n"
 
 
-def link_in_daily(vault, note_path, day):
+def link_in_daily(vault, note_path, day, title, session_id, old_path=None):
     folder = os.environ.get("OBSIDIAN_DAILY_FOLDER")
     if not folder:
         return
     daily = vault / folder / f"{day.strftime('%Y-%m-%d')}.md"
     daily.parent.mkdir(parents=True, exist_ok=True)
-    link = f"- [[{note_path.relative_to(vault).with_suffix('').as_posix()}]]"
+    target = note_path.relative_to(vault).with_suffix("").as_posix()
+    link = f"- [[{target}|{title}]]"
     existing = daily.read_text(encoding="utf-8") if daily.exists() else ""
     if link in existing:
         return
+    # Si la nota cambió de nombre, sustituye el enlace viejo en vez de añadir otro
+    olds = {f"{session_id[:8]}]]"}
+    if old_path is not None:
+        olds.add(f"[[{old_path.relative_to(vault).with_suffix('').as_posix()}")
+    kept = [l for l in existing.splitlines() if not any(o in l for o in olds)]
+    if len(kept) != len(existing.splitlines()):
+        existing = "\n".join(kept) + "\n"
     if "## Claude Code" not in existing:
         existing = existing.rstrip() + ("\n\n" if existing.strip() else "") + "## Claude Code\n"
     daily.write_text(existing.rstrip("\n") + "\n" + link + "\n", encoding="utf-8")
@@ -186,23 +224,47 @@ def git_push(vault, message):
     run(["git", "push"], vault)
 
 
+def find_note(root, session_id):
+    """Busca la nota de una sesión por su session_id (o por el nombre antiguo con el id)."""
+    marker = f"session_id: {session_id}\n"
+    legacy = f" {str(session_id)[:8]}.md"
+    for path in root.rglob("*.md"):
+        if path.name.endswith(legacy):
+            return path
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if marker in fh.read(1500):
+                    return path
+        except OSError:
+            continue
+    return None
+
+
 def write_session(vault, session_id, transcript, cwd, event):
     info = parse_transcript(transcript)
     cwd = cwd or info["cwd"]
-    if not info["prompts"] or not cwd:
+    if not info["prompts"] or not cwd or not session_id:
         return None
-    title, started, note = build_note(session_id, info, cwd, event)
+    title, project, started, note = build_note(session_id, info, cwd, event)
 
     root = vault / os.environ.get("OBSIDIAN_FOLDER", "Claude Sessions")
-    project = safe_name(Path(cwd).name) or "sin-proyecto"
-    session = str(session_id)[:8]
-    # Reutiliza la nota existente de esta sesión aunque cambie el título o el día
-    matches = sorted(root.rglob(f"* {session}.md")) if session else []
-    note_path = matches[0] if matches else root / project / f"{started.strftime('%Y-%m-%d')} {project} {session}.md"
+    folder = root / (safe_name(project) or "General")
+    name = f"{started.strftime('%Y-%m-%d')} {safe_name(title) or 'Sesión'}"
+    old_path = find_note(root, session_id)
+    note_path = folder / f"{name}.md"
+    if note_path.exists() and note_path != old_path:
+        note_path = folder / f"{name} ({str(session_id)[:8]}).md"  # mismo título el mismo día
+
     note_path.parent.mkdir(parents=True, exist_ok=True)
     note_path.write_text(note, encoding="utf-8")
+    if old_path is not None and old_path != note_path:
+        old_path.unlink(missing_ok=True)
+        try:
+            old_path.parent.rmdir()  # borra la carpeta vieja si se quedó vacía
+        except OSError:
+            pass
 
-    link_in_daily(vault, note_path, started)
+    link_in_daily(vault, note_path, started, title, str(session_id), old_path)
     return title
 
 
